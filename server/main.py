@@ -1,24 +1,29 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from typing import List, Dict
-import json
+from typing import Dict, List
 
 app = FastAPI()
 
-class ConnectionManager():
+# --- THE KEEP-ALIVE ENDPOINT ---
+@app.get("/health")
+async def health_check():
+    return {"status": "alive", "message": "Server is awake"}
+
+# --- THE WEBSOCKET LOGIC ---
+class ConnectionManager:
     def __init__(self):
-        self.rooms: Dict[str, List[WebSocket]] = []
+        self.rooms: Dict[str, List[WebSocket]] = {}
 
     async def connect(self, websocket: WebSocket, room_id: str):
         await websocket.accept()
-
         if room_id not in self.rooms:
             self.rooms[room_id] = []
         self.rooms[room_id].append(websocket)
 
     def disconnect(self, websocket: WebSocket, room_id: str):
-        self.rooms[room_id].remove(websocket)
-        if not self.rooms[room_id]:
-            del self.rooms[room_id]
+        if room_id in self.rooms and websocket in self.rooms[room_id]:
+            self.rooms[room_id].remove(websocket)
+            if not self.rooms[room_id]:
+                del self.rooms[room_id]
 
     async def broadcast(self, message: str, sender: WebSocket, room_id: str):
         if room_id in self.rooms:
@@ -34,7 +39,6 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
     try:
         while True:
             data = await websocket.receive_text()
-
             await manager.broadcast(data, sender=websocket, room_id=room_id)
     except WebSocketDisconnect:
         manager.disconnect(websocket, room_id)
