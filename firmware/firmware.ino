@@ -1,16 +1,14 @@
 #include <WiFi.h>
-#include <ArduinoWebsockets.h>
+#include <WebSocketsClient.h>
 #include <ArduinoJson.h>
 #include <FastLED.h>
-
-using namespace websockets;
 
 // ===================== CONFIGURATION =====================
 // Update these before flashing each lamp.
 const char* WIFI_SSID     = "YOUR_WIFI_SSID";
 const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
 
-const char* WS_HOST       = "YOUR_SERVER.onrender.com";
+const char* WS_HOST       = "elamper.onrender.com";  // no https://, no trailing slash
 const uint16_t WS_PORT    = 443;
 const char* ROOM_ID       = "pair-alpha";
 
@@ -49,10 +47,8 @@ const unsigned long DEBOUNCE_MS   = 50;
 unsigned long lastDebounce = 0;
 
 // ===================== WEBSOCKET =========================
-WebsocketsClient wsClient;
-bool wsConnected           = false;
-unsigned long lastReconnect = 0;
-const unsigned long RECONNECT_INTERVAL_MS = 3000;
+WebSocketsClient wsClient;
+bool wsConnected = false;
 
 // ---------------------------------------------------------
 int colorIndexByName(const char* name) {
@@ -72,24 +68,27 @@ void applyLEDs() {
 }
 
 void sendState() {
-  if (!wsConnected) return;
+  if (!wsConnected) {
+    Serial.println("(not connected, skipping send)");
+    return;
+  }
 
   StaticJsonDocument<64> doc;
   doc["power"] = powerOn;
   doc["color"] = COLORS[colorIndex].name;
 
   char buf[64];
-  serializeJson(doc, buf);
-  wsClient.send(buf);
+  size_t n = serializeJson(doc, buf);
+  wsClient.sendTXT(buf, n);
 
   Serial.printf("TX: %s\n", buf);
 }
 
-void onMessage(WebsocketsMessage msg) {
-  Serial.printf("RX: %s\n", msg.data().c_str());
+void handleIncoming(const char* payload) {
+  Serial.printf("RX: %s\n", payload);
 
   StaticJsonDocument<128> doc;
-  if (deserializeJson(doc, msg.data())) return;
+  if (deserializeJson(doc, payload)) return;
 
   if (doc.containsKey("power") && doc.containsKey("color")) {
     bool newPower = doc["power"];
@@ -106,32 +105,30 @@ void onMessage(WebsocketsMessage msg) {
   }
 }
 
-void onEvent(WebsocketsEvent event, String data) {
-  switch (event) {
-    case WebsocketsEvent::ConnectionOpened:
+void onWsEvent(WStype_t type, uint8_t* payload, size_t length) {
+  switch (type) {
+    case WStype_CONNECTED:
       wsConnected = true;
-      Serial.println("WebSocket connected");
+      Serial.printf("WebSocket connected to %s\n", (char*)payload);
       break;
-    case WebsocketsEvent::ConnectionClosed:
+    case WStype_DISCONNECTED:
       wsConnected = false;
       Serial.println("WebSocket disconnected");
       break;
-    case WebsocketsEvent::GotPing:
-      wsClient.pong();
+    case WStype_TEXT:
+      handleIncoming((char*)payload);
+      break;
+    case WStype_ERROR:
+      Serial.printf("WebSocket error: %s\n", (char*)payload);
       break;
     default:
       break;
   }
 }
 
-void connectWebSocket() {
-  String url = String("wss://") + WS_HOST + "/ws/lamps/" + ROOM_ID;
-  Serial.printf("Connecting to %s ...\n", url.c_str());
-  wsClient.connect(url);
-}
-
 void connectWiFi() {
   Serial.printf("Connecting to WiFi '%s'", WIFI_SSID);
+  WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
@@ -143,6 +140,7 @@ void connectWiFi() {
 // ======================== SETUP ==========================
 void setup() {
   Serial.begin(115200);
+  delay(500);
 
   pinMode(SENSOR_POWER_PIN, OUTPUT);
   digitalWrite(SENSOR_POWER_PIN, HIGH);
@@ -158,29 +156,26 @@ void setup() {
 
   connectWiFi();
 
-  wsClient.onMessage(onMessage);
-  wsClient.onEvent(onEvent);
-  connectWebSocket();
+  String path = String("/ws/lamps/") + ROOM_ID;
+  Serial.printf("Connecting WebSocket: wss://%s:%u%s\n", WS_HOST, WS_PORT, path.c_str());
+
+  wsClient.beginSSL(WS_HOST, WS_PORT, path.c_str());
+  wsClient.onEvent(onWsEvent);
+  wsClient.setReconnectInterval(3000);
+  wsClient.enableHeartbeat(15000, 3000, 2);
 }
 
 // ======================== LOOP ===========================
 void loop() {
-  wsClient.poll();
-
-  // --- Reconnect if needed ---
-  if (!wsConnected && millis() - lastReconnect > RECONNECT_INTERVAL_MS) {
-    lastReconnect = millis();
-    if (WiFi.status() != WL_CONNECTED) connectWiFi();
-    connectWebSocket();
-  }
+  wsClient.loop();
 
   // --- Read touch with debounce ---
   bool raw = digitalRead(TOUCH_PIN) == HIGH;
   if (millis() - lastDebounce < DEBOUNCE_MS) raw = lastTouchState;
   else lastDebounce = millis();
 
-  bool pressed  = raw && !lastTouchState;   // rising edge
-  bool released = !raw && lastTouchState;    // falling edge
+  bool pressed  = raw && !lastTouchState;
+  bool released = !raw && lastTouchState;
 
   if (pressed) {
     pressStart = millis();
@@ -204,7 +199,6 @@ void loop() {
 
   lastTouchState = raw;
 
-  // --- Push state if it changed ---
   if (stateChanged) {
     stateChanged = false;
     applyLEDs();
